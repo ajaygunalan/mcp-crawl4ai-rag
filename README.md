@@ -301,6 +301,12 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
 }
 ```
 
+## TODO
+
+- [ ] Fix URL bug: https://docs.ros.org/en/jazzy/index.html/Tutorials/Advanced/Security/Examine-Traffic.html should be https://docs.ros.org/en/jazzy/Tutorials/Advanced/Security/Examine-Traffic.html (remove index.html/)
+- [ ] Add exponential backoff/wait when hitting OpenAI rate limits
+- [ ] Make contextual embeddings always enabled, remove fallback
+
 ## Building Your Own Server
 
 This implementation provides a foundation for building more complex MCP servers with web crawling capabilities. To build your own:
