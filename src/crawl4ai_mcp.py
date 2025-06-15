@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
-from urllib.parse import urlparse, urldefrag
+from urllib.parse import urlparse, urldefrag, urljoin
 from xml.etree import ElementTree
 from dotenv import load_dotenv
 from supabase import Client
@@ -36,12 +36,42 @@ from utils import (
     search_code_examples
 )
 
+# Configuration constants
+DEFAULT_CHUNK_SIZE = 5000
+DEFAULT_MAX_DEPTH = 3
+DEFAULT_MAX_CONCURRENT = 10
+DEFAULT_BATCH_SIZE = 10
+DEFAULT_INSERT_BATCH_SIZE = 20
+DEFAULT_MATCH_COUNT = 10
+MEMORY_THRESHOLD_PERCENT = 70.0
+MEMORY_CHECK_INTERVAL = 1.0
+
 # Load environment variables from the project root .env file
 project_root = Path(__file__).resolve().parent.parent
 dotenv_path = project_root / '.env'
 
 # Force override of existing environment variables
 load_dotenv(dotenv_path, override=True)
+
+def fix_crawl4ai_url(url: str) -> str:
+    """
+    Fix Crawl4AI's URL bug where files like index.html are treated as directories.
+    
+    Example:
+    Input: https://docs.ros.org/en/jazzy/index.html/Tutorials/Advanced/Security/Examine-Traffic.html
+    Output: https://docs.ros.org/en/jazzy/Tutorials/Advanced/Security/Examine-Traffic.html
+    """
+    # Pattern: /filename.ext/ where ext is a common web file extension
+    pattern = r'(/[^/]+\.(html?|php|aspx?|jsp|cgi|xhtml))/'
+    match = re.search(pattern, url)
+    
+    if match:
+        # Remove the file part and rejoin
+        base_url = url[:match.start(1)]
+        remaining = url[match.end():]
+        return f"{base_url}/{remaining}"
+    
+    return url
 
 # Create a dataclass for our application context
 @dataclass
@@ -187,7 +217,7 @@ def parse_sitemap(sitemap_url: str) -> List[str]:
 
     return urls
 
-def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
+def smart_chunk_markdown(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> List[str]:
     """Split text into chunks, respecting code blocks and paragraphs."""
     chunks = []
     start = 0
@@ -405,8 +435,92 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             "error": str(e)
         }, indent=2)
 
+async def _process_crawl_results(supabase_client: Client, crawl_results: List[Dict[str, Any]], crawl_type: str, chunk_size: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Common processing logic for all crawl types.
+    
+    Args:
+        supabase_client: Supabase client instance
+        crawl_results: List of crawl results with 'url' and 'markdown' keys
+        crawl_type: Type of crawl (webpage, sitemap, text_file)
+        chunk_size: Size of chunks for processing
+        
+    Returns:
+        Tuple of (processing_stats, url_to_full_document)
+    """
+    urls = []
+    chunk_numbers = []
+    contents = []
+    metadatas = []
+    chunk_count = 0
+    
+    # Track sources and their content
+    source_content_map = {}
+    source_word_counts = {}
+    
+    # Process documentation chunks
+    for doc in crawl_results:
+        # Fix Crawl4AI's URL bug before processing
+        source_url = fix_crawl4ai_url(doc['url'])
+        md = doc['markdown']
+        chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+        
+        # Extract source_id
+        parsed_url = urlparse(source_url)
+        source_id = parsed_url.netloc or parsed_url.path
+        
+        # Store content for source summary generation
+        if source_id not in source_content_map:
+            source_content_map[source_id] = md[:5000]  # Store first 5000 chars
+            source_word_counts[source_id] = 0
+        
+        for i, chunk in enumerate(chunks):
+            urls.append(source_url)
+            chunk_numbers.append(i)
+            contents.append(chunk)
+            
+            # Extract metadata
+            meta = extract_section_info(chunk)
+            meta["chunk_index"] = i
+            meta["url"] = source_url
+            meta["source"] = source_id
+            meta["crawl_type"] = crawl_type
+            meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+            metadatas.append(meta)
+            
+            # Accumulate word count
+            source_word_counts[source_id] += meta.get("word_count", 0)
+            
+            chunk_count += 1
+    
+    # Create url_to_full_document mapping
+    url_to_full_document = {}
+    for doc in crawl_results:
+        # Use the fixed URL as key to match what we use in add_documents_to_supabase
+        fixed_url = fix_crawl4ai_url(doc['url'])
+        url_to_full_document[fixed_url] = doc['markdown']
+    
+    # Update source information for each unique source
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        source_summary_args = [(source_id, content) for source_id, content in source_content_map.items()]
+        source_summaries = list(executor.map(lambda args: extract_source_summary(args[0], args[1]), source_summary_args))
+    
+    for (source_id, _), summary in zip(source_summary_args, source_summaries):
+        word_count = source_word_counts.get(source_id, 0)
+        update_source_info(supabase_client, source_id, summary, word_count)
+    
+    # Add documentation chunks to Supabase
+    batch_size = DEFAULT_INSERT_BATCH_SIZE
+    add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
+    
+    return {
+        "chunks_stored": chunk_count,
+        "sources_updated": len(source_content_map),
+        "pages_crawled": len(crawl_results)
+    }, url_to_full_document
+
 @mcp.tool()
-async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concurrent: int = 10, chunk_size: int = 5000) -> str:
+async def smart_crawl_url(ctx: Context, url: str, max_depth: int = DEFAULT_MAX_DEPTH, max_concurrent: int = DEFAULT_MAX_CONCURRENT, chunk_size: int = DEFAULT_CHUNK_SIZE) -> str:
     """
     Intelligently crawl a URL based on its type and store content in Supabase.
     
@@ -452,148 +566,46 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
             crawl_results = await crawl_batch(crawler, sitemap_urls, max_concurrent=max_concurrent)
             crawl_type = "sitemap"
         else:
-            # For regular URLs, use recursive crawl
-            crawl_results = await crawl_recursive_internal_links(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent)
+            # For regular URLs, process in batches
             crawl_type = "webpage"
-        
-        if not crawl_results:
+            total_chunks_stored = 0
+            total_pages_crawled = 0
+            
+            # Process pages in batches
+            async for crawl_batch in crawl_recursive_internal_links_batch(crawler, [url], max_depth=max_depth, max_concurrent=max_concurrent, batch_size=DEFAULT_BATCH_SIZE):
+                print(f"\nProcessing batch of {len(crawl_batch)} pages...")
+                
+                # Process this batch using common logic
+                stats, _ = await _process_crawl_results(supabase_client, crawl_batch, crawl_type, chunk_size)
+                
+                total_chunks_stored += stats["chunks_stored"]
+                total_pages_crawled += stats["pages_crawled"]
+                
+                print(f"Stored {stats['chunks_stored']} chunks from {len(crawl_batch)} pages. Total so far: {total_chunks_stored} chunks from {total_pages_crawled} pages.")
+            
+            # After all batches, return summary
             return json.dumps({
-                "success": False,
+                "success": True,
                 "url": url,
-                "error": "No content found"
+                "crawl_type": crawl_type,
+                "pages_crawled": total_pages_crawled,
+                "chunks_stored": total_chunks_stored
             }, indent=2)
         
-        # Process results and store in Supabase
-        urls = []
-        chunk_numbers = []
-        contents = []
-        metadatas = []
-        chunk_count = 0
-        
-        # Track sources and their content
-        source_content_map = {}
-        source_word_counts = {}
-        
-        # Process documentation chunks
-        for doc in crawl_results:
-            source_url = doc['url']
-            md = doc['markdown']
-            chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
+        # For sitemap and text files, process all results at once
+        if crawl_type in ["sitemap", "text_file"]:
+            # Process results using common logic
+            stats, _ = await _process_crawl_results(supabase_client, crawl_results, crawl_type, chunk_size)
             
-            # Extract source_id
-            parsed_url = urlparse(source_url)
-            source_id = parsed_url.netloc or parsed_url.path
-            
-            # Store content for source summary generation
-            if source_id not in source_content_map:
-                source_content_map[source_id] = md[:5000]  # Store first 5000 chars
-                source_word_counts[source_id] = 0
-            
-            for i, chunk in enumerate(chunks):
-                urls.append(source_url)
-                chunk_numbers.append(i)
-                contents.append(chunk)
-                
-                # Extract metadata
-                meta = extract_section_info(chunk)
-                meta["chunk_index"] = i
-                meta["url"] = source_url
-                meta["source"] = source_id
-                meta["crawl_type"] = crawl_type
-                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
-                metadatas.append(meta)
-                
-                # Accumulate word count
-                source_word_counts[source_id] += meta.get("word_count", 0)
-                
-                chunk_count += 1
-        
-        # Create url_to_full_document mapping
-        url_to_full_document = {}
-        for doc in crawl_results:
-            url_to_full_document[doc['url']] = doc['markdown']
-        
-        # Update source information for each unique source FIRST (before inserting documents)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            source_summary_args = [(source_id, content) for source_id, content in source_content_map.items()]
-            source_summaries = list(executor.map(lambda args: extract_source_summary(args[0], args[1]), source_summary_args))
-        
-        for (source_id, _), summary in zip(source_summary_args, source_summaries):
-            word_count = source_word_counts.get(source_id, 0)
-            update_source_info(supabase_client, source_id, summary, word_count)
-        
-        # Add documentation chunks to Supabase (AFTER sources exist)
-        batch_size = 20
-        add_documents_to_supabase(supabase_client, urls, chunk_numbers, contents, metadatas, url_to_full_document, batch_size=batch_size)
-        
-        # Extract and process code examples from all documents only if enabled
-        extract_code_examples_enabled = os.getenv("USE_AGENTIC_RAG", "false") == "true"
-        if extract_code_examples_enabled:
-            all_code_blocks = []
-            code_urls = []
-            code_chunk_numbers = []
-            code_examples = []
-            code_summaries = []
-            code_metadatas = []
-            
-            # Extract code blocks from all documents
-            for doc in crawl_results:
-                source_url = doc['url']
-                md = doc['markdown']
-                code_blocks = extract_code_blocks(md)
-                
-                if code_blocks:
-                    # Process code examples in parallel
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        # Prepare arguments for parallel processing
-                        summary_args = [(block['code'], block['context_before'], block['context_after']) 
-                                        for block in code_blocks]
-                        
-                        # Generate summaries in parallel
-                        summaries = list(executor.map(process_code_example, summary_args))
-                    
-                    # Prepare code example data
-                    parsed_url = urlparse(source_url)
-                    source_id = parsed_url.netloc or parsed_url.path
-                    
-                    for i, (block, summary) in enumerate(zip(code_blocks, summaries)):
-                        code_urls.append(source_url)
-                        code_chunk_numbers.append(len(code_examples))  # Use global code example index
-                        code_examples.append(block['code'])
-                        code_summaries.append(summary)
-                        
-                        # Create metadata for code example
-                        code_meta = {
-                            "chunk_index": len(code_examples) - 1,
-                            "url": source_url,
-                            "source": source_id,
-                            "char_count": len(block['code']),
-                            "word_count": len(block['code'].split())
-                        }
-                        code_metadatas.append(code_meta)
-            
-            # Add all code examples to Supabase
-            if code_examples:
-                add_code_examples_to_supabase(
-                    supabase_client, 
-                    code_urls, 
-                    code_chunk_numbers, 
-                    code_examples, 
-                    code_summaries, 
-                    code_metadatas,
-                    batch_size=batch_size
-                )
-        
-        return json.dumps({
-            "success": True,
-            "url": url,
-            "crawl_type": crawl_type,
-            "pages_crawled": len(crawl_results),
-            "chunks_stored": chunk_count,
-            "code_examples_stored": len(code_examples),
-            "sources_updated": len(source_content_map),
-            "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
-        }, indent=2)
+            return json.dumps({
+                "success": True,
+                "url": url,
+                "crawl_type": crawl_type,
+                "pages_crawled": stats["pages_crawled"],
+                "chunks_stored": stats["chunks_stored"],
+                "sources_updated": stats["sources_updated"],
+                "urls_crawled": [doc['url'] for doc in crawl_results][:5] + (["..."] if len(crawl_results) > 5 else [])
+            }, indent=2)
     except Exception as e:
         return json.dumps({
             "success": False,
@@ -636,7 +648,7 @@ async def get_available_sources(ctx: Context) -> str:
                 sources.append({
                     "source_id": source.get("source_id"),
                     "summary": source.get("summary"),
-                    "total_words": source.get("total_words"),
+                    "total_words": source.get("total_word_count"),
                     "created_at": source.get("created_at"),
                     "updated_at": source.get("updated_at")
                 })
@@ -653,7 +665,7 @@ async def get_available_sources(ctx: Context) -> str:
         }, indent=2)
 
 @mcp.tool()
-async def perform_rag_query(ctx: Context, query: str, source: str = None, match_count: int = 5) -> str:
+async def perform_rag_query(ctx: Context, query: str, source: str = None, match_count: int = DEFAULT_MATCH_COUNT // 2) -> str:
     """
     Perform a RAG (Retrieval Augmented Generation) query on the stored content.
     
@@ -792,7 +804,7 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
         }, indent=2)
 
 @mcp.tool()
-async def search_code_examples(ctx: Context, query: str, source_id: str = None, match_count: int = 5) -> str:
+async def search_code_examples(ctx: Context, query: str, source_id: str = None, match_count: int = DEFAULT_MATCH_COUNT // 2) -> str:
     """
     Search for code examples relevant to the query.
     
@@ -968,7 +980,7 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
         print(f"Failed to crawl {url}: {result.error_message}")
         return []
 
-async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = 10) -> List[Dict[str, Any]]:
+async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent: int = DEFAULT_MAX_CONCURRENT) -> List[Dict[str, Any]]:
     """
     Batch crawl multiple URLs in parallel.
     
@@ -982,15 +994,99 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     """
     crawl_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
     dispatcher = MemoryAdaptiveDispatcher(
-        memory_threshold_percent=70.0,
-        check_interval=1.0,
+        memory_threshold_percent=MEMORY_THRESHOLD_PERCENT,
+        check_interval=MEMORY_CHECK_INTERVAL,
         max_session_permit=max_concurrent
     )
 
     results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
     return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
 
-async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
+async def crawl_recursive_internal_links_batch(
+    crawler: AsyncWebCrawler, 
+    start_urls: List[str], 
+    max_depth: int = DEFAULT_MAX_DEPTH, 
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT, 
+    batch_size: int = DEFAULT_BATCH_SIZE
+):
+    """
+    Recursively crawl internal links in batches, yielding results as we go.
+    
+    Yields:
+        List of dictionaries with URL and markdown content for each batch
+    """
+    visited = set()
+    
+    # Helper to prepare URLs (fix + normalize)
+    def prepare_url(url):
+        return urldefrag(fix_crawl4ai_url(url))[0]
+    
+    # Initialize with start URLs
+    current_urls = {prepare_url(url) for url in start_urls}
+    
+    # Setup crawler config once
+    config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
+    dispatcher = MemoryAdaptiveDispatcher(
+        memory_threshold_percent=MEMORY_THRESHOLD_PERCENT,
+        check_interval=MEMORY_CHECK_INTERVAL,
+        max_session_permit=max_concurrent
+    )
+    
+    for depth in range(max_depth):
+        if not current_urls:
+            break
+            
+        # Filter out visited URLs
+        to_crawl = list(current_urls - visited)
+        if not to_crawl:
+            break
+            
+        # Process in batches
+        for i in range(0, len(to_crawl), batch_size):
+            batch = to_crawl[i:i + batch_size]
+            
+            # Crawl batch
+            results = await crawler.arun_many(
+                urls=batch, 
+                config=config, 
+                dispatcher=dispatcher
+            )
+            
+            # Process results
+            next_urls = set()
+            batch_results = []
+            
+            for result in results:
+                if not result.success or not result.markdown:
+                    continue
+                    
+                url = prepare_url(result.url)
+                visited.add(url)
+                
+                # Yield result
+                batch_results.append({
+                    'url': url, 
+                    'markdown': result.markdown
+                })
+                
+                # Collect internal links for next depth
+                for link in result.links.get("internal", []):
+                    next_url = prepare_url(link["href"])
+                    if next_url not in visited:
+                        next_urls.add(next_url)
+            
+            # Yield batch if not empty
+            if batch_results:
+                yield batch_results
+            
+            # Update current_urls with newly discovered links
+            current_urls.update(next_urls)
+        
+        # Remove visited URLs for next depth
+        current_urls -= visited
+
+# Keep the old function for backward compatibility
+async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = DEFAULT_MAX_DEPTH, max_concurrent: int = DEFAULT_MAX_CONCURRENT) -> List[Dict[str, Any]]:
     """
     Recursively crawl internal links from start URLs up to a maximum depth.
     
@@ -1003,42 +1099,9 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
     Returns:
         List of dictionaries with URL and markdown content
     """
-    run_config = CrawlerRunConfig(cache_mode=CacheMode.BYPASS, stream=False)
-    dispatcher = MemoryAdaptiveDispatcher(
-        memory_threshold_percent=70.0,
-        check_interval=1.0,
-        max_session_permit=max_concurrent
-    )
-
-    visited = set()
-
-    def normalize_url(url):
-        return urldefrag(url)[0]
-
-    current_urls = set([normalize_url(u) for u in start_urls])
     results_all = []
-
-    for depth in range(max_depth):
-        urls_to_crawl = [normalize_url(url) for url in current_urls if normalize_url(url) not in visited]
-        if not urls_to_crawl:
-            break
-
-        results = await crawler.arun_many(urls=urls_to_crawl, config=run_config, dispatcher=dispatcher)
-        next_level_urls = set()
-
-        for result in results:
-            norm_url = normalize_url(result.url)
-            visited.add(norm_url)
-
-            if result.success and result.markdown:
-                results_all.append({'url': result.url, 'markdown': result.markdown})
-                for link in result.links.get("internal", []):
-                    next_url = normalize_url(link["href"])
-                    if next_url not in visited:
-                        next_level_urls.add(next_url)
-
-        current_urls = next_level_urls
-
+    async for batch in crawl_recursive_internal_links_batch(crawler, start_urls, max_depth, max_concurrent):
+        results_all.extend(batch)
     return results_all
 
 async def main():

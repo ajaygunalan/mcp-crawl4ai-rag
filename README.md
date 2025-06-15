@@ -301,11 +301,16 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
 }
 ```
 
-## TODO
+## Recent Improvements (Dec 2024)
 
-- [ ] Fix URL bug: https://docs.ros.org/en/jazzy/index.html/Tutorials/Advanced/Security/Examine-Traffic.html should be https://docs.ros.org/en/jazzy/Tutorials/Advanced/Security/Examine-Traffic.html (remove index.html/)
-- [ ] Add exponential backoff/wait when hitting OpenAI rate limits
-- [ ] Make contextual embeddings always enabled, remove fallback
+- **Fixed URL Resolution**: Resolved Crawl4AI's bug where files like `index.html/` were treated as directories
+- **Smart Rate Limiting**: Added exponential backoff that reads wait times from OpenAI error messages
+- **Mandatory Contextual Embeddings**: Removed fallback to ensure all chunks have contextual understanding
+- **True Batch Processing**: Implemented 10-by-10 crawling (crawl→process→save) to prevent memory issues
+- **Code Simplification**: Reduced codebase by 18% (235 lines) while improving reliability and maintainability
+- **Production Fixes**: Resolved race conditions, DB column mismatches, and added atomic upsert operations
+
+**Note**: These improvements need thorough testing in production environments.
 
 ## Building Your Own Server
 

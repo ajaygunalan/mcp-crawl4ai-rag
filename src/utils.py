@@ -10,9 +10,59 @@ from urllib.parse import urlparse
 import openai
 import re
 import time
+import functools
 
 # Load OpenAI API key for embeddings
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+# Configuration constants
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_EMBEDDING_DIM = 1536
+MAX_RETRIES = 10
+BASE_RETRY_DELAY = 2.0
+MAX_RETRY_DELAY = 60.0
+DEFAULT_BATCH_SIZE = 20
+MAX_DOCUMENT_LENGTH = 25000
+MAX_CONTEXT_TOKENS = 200
+MIN_CODE_BLOCK_LENGTH = 1000
+CODE_CONTEXT_LENGTH = 500
+PARALLEL_WORKERS = 3
+
+def retry_with_backoff(max_retries=MAX_RETRIES, base_delay=BASE_RETRY_DELAY, max_delay=MAX_RETRY_DELAY):
+    """
+    Decorator for exponential backoff retry logic.
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds
+        max_delay: Maximum delay between retries
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for retry in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if retry >= max_retries - 1:
+                        raise
+                    
+                    # Calculate wait time with exponential backoff
+                    wait_time = min(base_delay * (2 ** retry), max_delay)
+                    
+                    # Extract wait time from rate limit errors if available
+                    error_str = str(e)
+                    if "rate_limit_exceeded" in error_str or "429" in error_str:
+                        match = re.search(r'try again in (\d+\.?\d*)s', error_str)
+                        if match:
+                            wait_time = float(match.group(1)) + 0.5  # Add buffer
+                    
+                    print(f"Error: {e}. Retrying in {wait_time:.1f}s... (attempt {retry + 1}/{max_retries})")
+                    time.sleep(wait_time)
+            
+            raise Exception(f"Failed after {max_retries} attempts")
+        return wrapper
+    return decorator
 
 def get_supabase_client() -> Client:
     """
@@ -29,6 +79,7 @@ def get_supabase_client() -> Client:
     
     return create_client(url, key)
 
+@retry_with_backoff(max_retries=3, base_delay=1.0)
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
     Create embeddings for multiple texts in a single API call.
@@ -42,44 +93,11 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     if not texts:
         return []
     
-    max_retries = 3
-    retry_delay = 1.0  # Start with 1 second delay
-    
-    for retry in range(max_retries):
-        try:
-            response = openai.embeddings.create(
-                model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
-                input=texts
-            )
-            return [item.embedding for item in response.data]
-        except Exception as e:
-            if retry < max_retries - 1:
-                print(f"Error creating batch embeddings (attempt {retry + 1}/{max_retries}): {e}")
-                print(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-            else:
-                print(f"Failed to create batch embeddings after {max_retries} attempts: {e}")
-                # Try creating embeddings one by one as fallback
-                print("Attempting to create embeddings individually...")
-                embeddings = []
-                successful_count = 0
-                
-                for i, text in enumerate(texts):
-                    try:
-                        individual_response = openai.embeddings.create(
-                            model="text-embedding-3-small",
-                            input=[text]
-                        )
-                        embeddings.append(individual_response.data[0].embedding)
-                        successful_count += 1
-                    except Exception as individual_error:
-                        print(f"Failed to create embedding for text {i}: {individual_error}")
-                        # Add zero embedding as fallback
-                        embeddings.append([0.0] * 1536)
-                
-                print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
-                return embeddings
+    response = openai.embeddings.create(
+        model=DEFAULT_EMBEDDING_MODEL,
+        input=texts
+    )
+    return [item.embedding for item in response.data]
 
 def create_embedding(text: str) -> List[float]:
     """
@@ -91,14 +109,10 @@ def create_embedding(text: str) -> List[float]:
     Returns:
         List of floats representing the embedding
     """
-    try:
-        embeddings = create_embeddings_batch([text])
-        return embeddings[0] if embeddings else [0.0] * 1536
-    except Exception as e:
-        print(f"Error creating embedding: {e}")
-        # Return empty embedding if there's an error
-        return [0.0] * 1536
+    embeddings = create_embeddings_batch([text])
+    return embeddings[0] if embeddings else [0.0] * DEFAULT_EMBEDDING_DIM
 
+@retry_with_backoff(max_retries=MAX_RETRIES, base_delay=BASE_RETRY_DELAY)
 def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
     """
     Generate contextual information for a chunk within a document to improve retrieval.
@@ -110,14 +124,12 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
     Returns:
         Tuple containing:
         - The contextual text that situates the chunk within the document
-        - Boolean indicating if contextual embedding was performed
+        - Boolean indicating if contextual embedding was performed (always True now)
     """
     model_choice = os.getenv("MODEL_CHOICE")
     
-    try:
-        # Create the prompt for generating contextual information
-        prompt = f"""<document> 
-{full_document[:25000]} 
+    prompt = f"""<document> 
+{full_document[:MAX_DOCUMENT_LENGTH]} 
 </document>
 Here is the chunk we want to situate within the whole document 
 <chunk> 
@@ -125,28 +137,18 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
-        # Call the OpenAI API to generate contextual information
-        response = openai.chat.completions.create(
-            model=model_choice,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=200
-        )
-        
-        # Extract the generated context
-        context = response.choices[0].message.content.strip()
-        
-        # Combine the context with the original chunk
-        contextual_text = f"{context}\n---\n{chunk}"
-        
-        return contextual_text, True
+    response = openai.chat.completions.create(
+        model=model_choice,
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3,
+        max_tokens=MAX_CONTEXT_TOKENS
+    )
     
-    except Exception as e:
-        print(f"Error generating contextual embedding: {e}. Using original chunk instead.")
-        return chunk, False
+    context = response.choices[0].message.content.strip()
+    return f"{context}\n---\n{chunk}", True
 
 def process_chunk_with_context(args):
     """
@@ -159,10 +161,15 @@ def process_chunk_with_context(args):
     Returns:
         Tuple containing:
         - The contextual text that situates the chunk within the document
-        - Boolean indicating if contextual embedding was performed
+        - Boolean indicating if contextual embedding was performed (always True now)
     """
     url, content, full_document = args
     return generate_contextual_embedding(full_document, content)
+
+@retry_with_backoff(max_retries=3, base_delay=1.0)
+def _insert_batch_with_retry(client, table_name: str, data: List[Dict[str, Any]]):
+    """Insert data batch with automatic retry."""
+    client.table(table_name).insert(data).execute()
 
 def add_documents_to_supabase(
     client: Client, 
@@ -171,148 +178,80 @@ def add_documents_to_supabase(
     contents: List[str], 
     metadatas: List[Dict[str, Any]],
     url_to_full_document: Dict[str, str],
-    batch_size: int = 20
+    batch_size: int = DEFAULT_BATCH_SIZE
 ) -> None:
     """
-    Add documents to the Supabase crawled_pages table in batches.
-    Deletes existing records with the same URLs before inserting to prevent duplicates.
-    
-    Args:
-        client: Supabase client
-        urls: List of URLs
-        chunk_numbers: List of chunk numbers
-        contents: List of document contents
-        metadatas: List of document metadata
-        url_to_full_document: Dictionary mapping URLs to their full document content
-        batch_size: Size of each batch for insertion
+    Add documents to Supabase with contextual embeddings.
     """
-    # Get unique URLs to delete existing records
+    # Delete existing records
     unique_urls = list(set(urls))
-    
-    # Delete existing records for these URLs in a single operation
     try:
         if unique_urls:
-            # Use the .in_() filter to delete all records with matching URLs
             client.table("crawled_pages").delete().in_("url", unique_urls).execute()
     except Exception as e:
-        print(f"Batch delete failed: {e}. Trying one-by-one deletion as fallback.")
-        # Fallback: delete records one by one
+        print(f"Batch delete failed: {e}")
+        # Fallback to individual deletes
         for url in unique_urls:
             try:
                 client.table("crawled_pages").delete().eq("url", url).execute()
-            except Exception as inner_e:
-                print(f"Error deleting record for URL {url}: {inner_e}")
-                # Continue with the next URL even if one fails
+            except Exception:
+                pass
     
-    # Check if MODEL_CHOICE is set for contextual embeddings
-    use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") == "true"
-    print(f"\n\nUse contextual embeddings: {use_contextual_embeddings}\n\n")
+    print("\n\nContextual embeddings enabled (mandatory)\n\n")
     
-    # Process in batches to avoid memory issues
+    # Process in batches
     for i in range(0, len(contents), batch_size):
         batch_end = min(i + batch_size, len(contents))
+        batch_slice = slice(i, batch_end)
         
-        # Get batch slices
-        batch_urls = urls[i:batch_end]
-        batch_chunk_numbers = chunk_numbers[i:batch_end]
-        batch_contents = contents[i:batch_end]
-        batch_metadatas = metadatas[i:batch_end]
+        # Generate contextual embeddings sequentially (I/O bound, no benefit from parallel)
+        contextual_contents = []
+        for j, (url, content) in enumerate(zip(urls[batch_slice], contents[batch_slice])):
+            full_doc = url_to_full_document.get(url, "")
+            contextual_text, _ = generate_contextual_embedding(full_doc, content)
+            contextual_contents.append(contextual_text)
+            metadatas[i + j]["contextual_embedding"] = True
         
-        # Apply contextual embedding to each chunk if MODEL_CHOICE is set
-        if use_contextual_embeddings:
-            # Prepare arguments for parallel processing
-            process_args = []
-            for j, content in enumerate(batch_contents):
-                url = batch_urls[j]
-                full_document = url_to_full_document.get(url, "")
-                process_args.append((url, content, full_document))
-            
-            # Process in parallel using ThreadPoolExecutor
-            contextual_contents = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                # Submit all tasks and collect results
-                future_to_idx = {executor.submit(process_chunk_with_context, arg): idx 
-                                for idx, arg in enumerate(process_args)}
-                
-                # Process results as they complete
-                for future in concurrent.futures.as_completed(future_to_idx):
-                    idx = future_to_idx[future]
-                    try:
-                        result, success = future.result()
-                        contextual_contents.append(result)
-                        if success:
-                            batch_metadatas[idx]["contextual_embedding"] = True
-                    except Exception as e:
-                        print(f"Error processing chunk {idx}: {e}")
-                        # Use original content as fallback
-                        contextual_contents.append(batch_contents[idx])
-            
-            # Sort results back into original order if needed
-            if len(contextual_contents) != len(batch_contents):
-                print(f"Warning: Expected {len(batch_contents)} results but got {len(contextual_contents)}")
-                # Use original contents as fallback
-                contextual_contents = batch_contents
-        else:
-            # If not using contextual embeddings, use original contents
-            contextual_contents = batch_contents
+        # Create embeddings batch
+        embeddings = create_embeddings_batch(contextual_contents)
         
-        # Create embeddings for the entire batch at once
-        batch_embeddings = create_embeddings_batch(contextual_contents)
-        
+        # Prepare batch data
         batch_data = []
-        for j in range(len(contextual_contents)):
-            # Extract metadata fields
-            chunk_size = len(contextual_contents[j])
-            
-            # Extract source_id from URL
-            parsed_url = urlparse(batch_urls[j])
-            source_id = parsed_url.netloc or parsed_url.path
-            
-            # Prepare data for insertion
-            data = {
-                "url": batch_urls[j],
-                "chunk_number": batch_chunk_numbers[j],
-                "content": contextual_contents[j],  # Store original content
+        for j, (url, chunk_num, content, metadata, embedding) in enumerate(
+            zip(urls[batch_slice], 
+                chunk_numbers[batch_slice], 
+                contextual_contents,
+                metadatas[batch_slice],
+                embeddings)
+        ):
+            parsed_url = urlparse(url)
+            batch_data.append({
+                "url": url,
+                "chunk_number": chunk_num,
+                "content": content,
                 "metadata": {
-                    "chunk_size": chunk_size,
-                    **batch_metadatas[j]
+                    "chunk_size": len(content),
+                    **metadata
                 },
-                "source_id": source_id,  # Add source_id field
-                "embedding": batch_embeddings[j]  # Use embedding from contextual content
-            }
+                "source_id": parsed_url.netloc or parsed_url.path,
+                "embedding": embedding
+            })
+        
+        # Insert with retry
+        try:
+            _insert_batch_with_retry(client, "crawled_pages", batch_data)
+        except Exception as e:
+            print(f"Batch insert failed: {e}. Attempting individual inserts...")
+            successful = 0
+            for record in batch_data:
+                try:
+                    client.table("crawled_pages").insert(record).execute()
+                    successful += 1
+                except Exception as err:
+                    print(f"Failed to insert {record['url']}: {err}")
             
-            batch_data.append(data)
-        
-        # Insert batch into Supabase with retry logic
-        max_retries = 3
-        retry_delay = 1.0  # Start with 1 second delay
-        
-        for retry in range(max_retries):
-            try:
-                client.table("crawled_pages").insert(batch_data).execute()
-                # Success - break out of retry loop
-                break
-            except Exception as e:
-                if retry < max_retries - 1:
-                    print(f"Error inserting batch into Supabase (attempt {retry + 1}/{max_retries}): {e}")
-                    print(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    # Final attempt failed
-                    print(f"Failed to insert batch after {max_retries} attempts: {e}")
-                    # Optionally, try inserting records one by one as a last resort
-                    print("Attempting to insert records individually...")
-                    successful_inserts = 0
-                    for record in batch_data:
-                        try:
-                            client.table("crawled_pages").insert(record).execute()
-                            successful_inserts += 1
-                        except Exception as individual_error:
-                            print(f"Failed to insert individual record for URL {record['url']}: {individual_error}")
-                    
-                    if successful_inserts > 0:
-                        print(f"Successfully inserted {successful_inserts}/{len(batch_data)} records individually")
+            if successful > 0:
+                print(f"Inserted {successful}/{len(batch_data)} records individually")
 
 def search_documents(
     client: Client, 
@@ -492,7 +431,7 @@ def add_code_examples_to_supabase(
     code_examples: List[str],
     summaries: List[str],
     metadatas: List[Dict[str, Any]],
-    batch_size: int = 20
+    batch_size: int = DEFAULT_BATCH_SIZE
 ):
     """
     Add code examples to the Supabase code_examples table in batches.
@@ -605,23 +544,13 @@ def update_source_info(client: Client, source_id: str, summary: str, word_count:
         word_count: Total word count for the source
     """
     try:
-        # Try to update existing source
-        result = client.table('sources').update({
+        # Use upsert to handle both insert and update atomically
+        client.table('sources').upsert({
+            'source_id': source_id,
             'summary': summary,
-            'total_word_count': word_count,
-            'updated_at': 'now()'
-        }).eq('source_id', source_id).execute()
-        
-        # If no rows were updated, insert new source
-        if not result.data:
-            client.table('sources').insert({
-                'source_id': source_id,
-                'summary': summary,
-                'total_word_count': word_count
-            }).execute()
-            print(f"Created new source: {source_id}")
-        else:
-            print(f"Updated source: {source_id}")
+            'total_word_count': word_count
+        }, on_conflict='source_id').execute()
+        print(f"Updated source: {source_id}")
             
     except Exception as e:
         print(f"Error updating source {source_id}: {e}")
