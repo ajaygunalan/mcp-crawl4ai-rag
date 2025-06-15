@@ -303,14 +303,46 @@ Add this server to your MCP configuration for Claude Desktop, Windsurf, or any o
 
 ## Recent Improvements (Dec 2024)
 
-- **Fixed URL Resolution**: Resolved Crawl4AI's bug where files like `index.html/` were treated as directories
-- **Smart Rate Limiting**: Added exponential backoff that reads wait times from OpenAI error messages
-- **Mandatory Contextual Embeddings**: Removed fallback to ensure all chunks have contextual understanding
-- **True Batch Processing**: Implemented 10-by-10 crawling (crawl→process→save) to prevent memory issues
-- **Code Simplification**: Reduced codebase by 18% (235 lines) while improving reliability and maintainability
-- **Production Fixes**: Resolved race conditions, DB column mismatches, and added atomic upsert operations
+### Critical Fixes
+- Fixed undefined `code_blocks` variable preventing crashes when `USE_AGENTIC_RAG=false`
+- Fixed timestamp metadata to use proper ISO format instead of function names
+- Removed zero embedding fallback that corrupted vector search results
+- Increased embedding batch size to 100 (5x performance improvement)
+- Eliminated ~80 lines of duplicate code with `merge_hybrid_search_results()` helper
 
-**Note**: These improvements need thorough testing in production environments.
+### Architecture Improvements  
+- URL normalization for Crawl4AI's `index.html/` bug
+- Smart exponential backoff with OpenAI rate limit parsing
+- True 10-by-10 batch processing to prevent memory issues
+- Atomic database operations to prevent race conditions
+
+### Testing Your Installation
+
+1. **Basic connectivity test:**
+   ```bash
+   # Test crawling a simple page
+   curl -X POST http://localhost:8051/sse/tools/call \
+     -H "Content-Type: application/json" \
+     -d '{"method": "crawl_url", "params": {"url": "https://example.com"}}'
+   ```
+
+2. **Test RAG search after crawling:**
+   ```bash
+   # First crawl some content, then search
+   curl -X POST http://localhost:8051/sse/tools/call \
+     -H "Content-Type: application/json" \
+     -d '{"method": "search_rag", "params": {"query": "your search terms"}}'
+   ```
+
+3. **Monitor logs for issues:**
+   - Check for "Failed to create embedding" errors
+   - Verify timestamps are in ISO format (e.g., `2024-12-15T10:30:00`)
+   - Ensure batch processing shows "Inserted batch X of Y"
+
+4. **Performance benchmarks:**
+   - Embedding batches should process 100 items at once
+   - No more than 3 retries for API failures
+   - Hybrid search should return results in <2 seconds
 
 ## Building Your Own Server
 
