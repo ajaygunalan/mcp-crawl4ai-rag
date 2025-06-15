@@ -21,6 +21,7 @@ import json
 import os
 import re
 import concurrent.futures
+from datetime import datetime
 
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, MemoryAdaptiveDispatcher
 
@@ -281,6 +282,61 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
         "word_count": len(chunk.split())
     }
 
+def merge_hybrid_search_results(vector_results: List[Dict], keyword_results: List[Dict], match_count: int) -> List[Dict]:
+    """
+    Merge vector and keyword search results, prioritizing items that appear in both.
+    
+    Args:
+        vector_results: Results from vector similarity search
+        keyword_results: Results from keyword search
+        match_count: Maximum number of results to return
+        
+    Returns:
+        Combined and deduplicated results
+    """
+    seen_ids = set()
+    combined_results = []
+    
+    # First, add items that appear in both searches (these are the best matches)
+    vector_ids = {r.get('id') for r in vector_results if r.get('id')}
+    for kr in keyword_results:
+        if kr['id'] in vector_ids and kr['id'] not in seen_ids:
+            # Find the vector result to get similarity score
+            for vr in vector_results:
+                if vr.get('id') == kr['id']:
+                    # Boost similarity score for items in both results
+                    vr['similarity'] = min(1.0, vr.get('similarity', 0) * 1.2)
+                    combined_results.append(vr)
+                    seen_ids.add(kr['id'])
+                    break
+    
+    # Then add remaining vector results (semantic matches without exact keyword)
+    for vr in vector_results:
+        if vr.get('id') and vr['id'] not in seen_ids and len(combined_results) < match_count:
+            combined_results.append(vr)
+            seen_ids.add(vr['id'])
+    
+    # Finally, add pure keyword matches if we still need more results
+    for kr in keyword_results:
+        if kr['id'] not in seen_ids and len(combined_results) < match_count:
+            # Convert keyword result to match vector result format
+            result = {
+                'id': kr['id'],
+                'url': kr['url'],
+                'chunk_number': kr['chunk_number'],
+                'content': kr['content'],
+                'metadata': kr['metadata'],
+                'source_id': kr['source_id'],
+                'similarity': 0.5  # Default similarity for keyword-only matches
+            }
+            # Include optional fields if present
+            if 'summary' in kr:
+                result['summary'] = kr['summary']
+            combined_results.append(result)
+            seen_ids.add(kr['id'])
+    
+    return combined_results[:match_count]
+
 def process_code_example(args):
     """
     Process a single code example to generate its summary.
@@ -346,7 +402,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
                 meta["chunk_index"] = i
                 meta["url"] = url
                 meta["source"] = source_id
-                meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                meta["crawl_time"] = datetime.utcnow().isoformat()
                 metadatas.append(meta)
                 
                 # Accumulate word count
@@ -364,6 +420,7 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             
             # Extract and process code examples only if enabled
             extract_code_examples = os.getenv("USE_AGENTIC_RAG", "false") == "true"
+            code_blocks = []  # Initialize to empty list to avoid UnboundLocalError
             if extract_code_examples:
                 code_blocks = extract_code_blocks(result.markdown)
                 if code_blocks:
@@ -485,7 +542,7 @@ async def _process_crawl_results(supabase_client: Client, crawl_results: List[Di
             meta["url"] = source_url
             meta["source"] = source_id
             meta["crawl_type"] = crawl_type
-            meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+            meta["crawl_time"] = datetime.utcnow().isoformat()
             metadatas.append(meta)
             
             # Accumulate word count
@@ -718,46 +775,8 @@ async def perform_rag_query(ctx: Context, query: str, source: str = None, match_
             keyword_response = keyword_query.limit(match_count * 2).execute()
             keyword_results = keyword_response.data if keyword_response.data else []
             
-            # 3. Combine results with preference for items appearing in both
-            seen_ids = set()
-            combined_results = []
-            
-            # First, add items that appear in both searches (these are the best matches)
-            vector_ids = {r.get('id') for r in vector_results if r.get('id')}
-            for kr in keyword_results:
-                if kr['id'] in vector_ids and kr['id'] not in seen_ids:
-                    # Find the vector result to get similarity score
-                    for vr in vector_results:
-                        if vr.get('id') == kr['id']:
-                            # Boost similarity score for items in both results
-                            vr['similarity'] = min(1.0, vr.get('similarity', 0) * 1.2)
-                            combined_results.append(vr)
-                            seen_ids.add(kr['id'])
-                            break
-            
-            # Then add remaining vector results (semantic matches without exact keyword)
-            for vr in vector_results:
-                if vr.get('id') and vr['id'] not in seen_ids and len(combined_results) < match_count:
-                    combined_results.append(vr)
-                    seen_ids.add(vr['id'])
-            
-            # Finally, add pure keyword matches if we still need more results
-            for kr in keyword_results:
-                if kr['id'] not in seen_ids and len(combined_results) < match_count:
-                    # Convert keyword result to match vector result format
-                    combined_results.append({
-                        'id': kr['id'],
-                        'url': kr['url'],
-                        'chunk_number': kr['chunk_number'],
-                        'content': kr['content'],
-                        'metadata': kr['metadata'],
-                        'source_id': kr['source_id'],
-                        'similarity': 0.5  # Default similarity for keyword-only matches
-                    })
-                    seen_ids.add(kr['id'])
-            
-            # Use combined results
-            results = combined_results[:match_count]
+            # 3. Combine results using helper function
+            results = merge_hybrid_search_results(vector_results, keyword_results, match_count)
             
         else:
             # Standard vector search only
@@ -870,47 +889,8 @@ async def search_code_examples(ctx: Context, query: str, source_id: str = None, 
             keyword_response = keyword_query.limit(match_count * 2).execute()
             keyword_results = keyword_response.data if keyword_response.data else []
             
-            # 3. Combine results with preference for items appearing in both
-            seen_ids = set()
-            combined_results = []
-            
-            # First, add items that appear in both searches (these are the best matches)
-            vector_ids = {r.get('id') for r in vector_results if r.get('id')}
-            for kr in keyword_results:
-                if kr['id'] in vector_ids and kr['id'] not in seen_ids:
-                    # Find the vector result to get similarity score
-                    for vr in vector_results:
-                        if vr.get('id') == kr['id']:
-                            # Boost similarity score for items in both results
-                            vr['similarity'] = min(1.0, vr.get('similarity', 0) * 1.2)
-                            combined_results.append(vr)
-                            seen_ids.add(kr['id'])
-                            break
-            
-            # Then add remaining vector results (semantic matches without exact keyword)
-            for vr in vector_results:
-                if vr.get('id') and vr['id'] not in seen_ids and len(combined_results) < match_count:
-                    combined_results.append(vr)
-                    seen_ids.add(vr['id'])
-            
-            # Finally, add pure keyword matches if we still need more results
-            for kr in keyword_results:
-                if kr['id'] not in seen_ids and len(combined_results) < match_count:
-                    # Convert keyword result to match vector result format
-                    combined_results.append({
-                        'id': kr['id'],
-                        'url': kr['url'],
-                        'chunk_number': kr['chunk_number'],
-                        'content': kr['content'],
-                        'summary': kr['summary'],
-                        'metadata': kr['metadata'],
-                        'source_id': kr['source_id'],
-                        'similarity': 0.5  # Default similarity for keyword-only matches
-                    })
-                    seen_ids.add(kr['id'])
-            
-            # Use combined results
-            results = combined_results[:match_count]
+            # 3. Combine results using helper function
+            results = merge_hybrid_search_results(vector_results, keyword_results, match_count)
             
         else:
             # Standard vector search only

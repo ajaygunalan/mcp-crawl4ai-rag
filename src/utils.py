@@ -21,7 +21,7 @@ DEFAULT_EMBEDDING_DIM = 1536
 MAX_RETRIES = 10
 BASE_RETRY_DELAY = 2.0
 MAX_RETRY_DELAY = 60.0
-DEFAULT_BATCH_SIZE = 20
+DEFAULT_BATCH_SIZE = 100  # Increased from 20 for 5x fewer API calls
 MAX_DOCUMENT_LENGTH = 25000
 MAX_CONTEXT_TOKENS = 200
 MIN_CODE_BLOCK_LENGTH = 1000
@@ -108,9 +108,14 @@ def create_embedding(text: str) -> List[float]:
         
     Returns:
         List of floats representing the embedding
+        
+    Raises:
+        Exception: If embedding creation fails
     """
     embeddings = create_embeddings_batch([text])
-    return embeddings[0] if embeddings else [0.0] * DEFAULT_EMBEDDING_DIM
+    if not embeddings or len(embeddings) == 0:
+        raise Exception(f"Failed to create embedding for text: {text[:100]}...")
+    return embeddings[0]
 
 @retry_with_backoff(max_retries=MAX_RETRIES, base_delay=BASE_RETRY_DELAY)
 def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
